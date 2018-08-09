@@ -3,10 +3,12 @@ package acme
 import (
 	"crypto/tls"
 	"testing"
+	"time"
 
 	"github.com/containous/traefik/safe"
 	traefiktls "github.com/containous/traefik/tls"
 	"github.com/containous/traefik/types"
+	"github.com/patrickmn/go-cache"
 	"github.com/stretchr/testify/assert"
 	"github.com/xenolf/lego/acme"
 )
@@ -25,12 +27,13 @@ func TestGetUncheckedCertificates(t *testing.T) {
 	domainSafe.Set(domainMap)
 
 	testCases := []struct {
-		desc             string
-		dynamicCerts     *safe.Safe
-		staticCerts      *safe.Safe
-		acmeCertificates []*Certificate
-		domains          []string
-		expectedDomains  []string
+		desc                   string
+		dynamicCerts           *safe.Safe
+		staticCerts            *safe.Safe
+		resolveInProgressCache *cache.Cache
+		acmeCertificates       []*Certificate
+		domains                []string
+		expectedDomains        []string
 	}{
 		{
 			desc:            "wildcard to generate",
@@ -140,10 +143,47 @@ func TestGetUncheckedCertificates(t *testing.T) {
 			},
 			expectedDomains: []string{"traefik.wtf"},
 		},
+		{
+			desc:    "all domains already managed by ACME",
+			domains: []string{"traefik.wtf", "foo.traefik.wtf"},
+			resolveInProgressCache: cache.NewFrom(5*time.Second, 2*time.Second, map[string]cache.Item{
+				"traefik.wtf":     {},
+				"foo.traefik.wtf": {},
+			}),
+			expectedDomains: []string{},
+		},
+		{
+			desc:    "one domain already managed by ACME",
+			domains: []string{"traefik.wtf", "foo.traefik.wtf"},
+			resolveInProgressCache: cache.NewFrom(5*time.Second, 2*time.Second, map[string]cache.Item{
+				"traefik.wtf": {},
+			}),
+			expectedDomains: []string{"foo.traefik.wtf"},
+		},
+		{
+			desc:    "wildcard domain already managed by ACME checks the domains",
+			domains: []string{"bar.traefik.wtf", "foo.traefik.wtf"},
+			resolveInProgressCache: cache.NewFrom(5*time.Second, 2*time.Second, map[string]cache.Item{
+				"*.traefik.wtf": {},
+			}),
+			expectedDomains: []string{},
+		},
+		{
+			desc:    "wildcard domain already managed by ACME checks domains and another domain checks one other domain, one domain still unchecked",
+			domains: []string{"traefik.wtf", "bar.traefik.wtf", "foo.traefik.wtf", "acme.wtf"},
+			resolveInProgressCache: cache.NewFrom(5*time.Second, 2*time.Second, map[string]cache.Item{
+				"*.traefik.wtf": {},
+				"traefik.wtf":   {},
+			}),
+			expectedDomains: []string{"acme.wtf"},
+		},
 	}
 
 	for _, test := range testCases {
 		test := test
+		if test.resolveInProgressCache == nil {
+			test.resolveInProgressCache = cache.New(5*time.Second, 2*time.Second)
+		}
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -152,11 +192,13 @@ func TestGetUncheckedCertificates(t *testing.T) {
 					DynamicCerts: test.dynamicCerts,
 					StaticCerts:  test.staticCerts,
 				},
-				certificates: test.acmeCertificates,
+				certificates:              test.acmeCertificates,
+				resolutionInProgressCache: test.resolveInProgressCache,
 			}
 
 			domains := acmeProvider.getUncheckedDomains(test.domains, false)
 			assert.Equal(t, len(test.expectedDomains), len(domains), "Unexpected domains.")
+			acmeProvider.resolutionInProgressCache.Flush()
 		})
 	}
 }

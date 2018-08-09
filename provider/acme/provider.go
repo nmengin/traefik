@@ -21,6 +21,7 @@ import (
 	traefiktls "github.com/containous/traefik/tls"
 	"github.com/containous/traefik/types"
 	"github.com/containous/traefik/version"
+	"github.com/patrickmn/go-cache"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/xenolf/lego/acme"
@@ -52,16 +53,18 @@ type Configuration struct {
 // Provider holds configurations of the provider.
 type Provider struct {
 	*Configuration
-	Store                  Store
-	certificates           []*Certificate
-	account                *Account
-	client                 *acme.Client
-	certsChan              chan *Certificate
-	configurationChan      chan<- types.ConfigMessage
-	certificateStore       *traefiktls.CertificateStore
-	clientMutex            sync.Mutex
-	configFromListenerChan chan types.Configuration
-	pool                   *safe.Pool
+	Store                     Store
+	certificates              []*Certificate
+	account                   *Account
+	client                    *acme.Client
+	certsChan                 chan *Certificate
+	configurationChan         chan<- types.ConfigMessage
+	certificateStore          *traefiktls.CertificateStore
+	clientMutex               sync.Mutex
+	configFromListenerChan    chan types.Configuration
+	pool                      *safe.Pool
+	resolutionInProgressCache *cache.Cache
+	resolutionInProgressMutex sync.Mutex
 }
 
 // Certificate is a struct which contains all data needed from an ACME certificate
@@ -143,6 +146,9 @@ func (p *Provider) Init(_ types.Constraints) error {
 	if err != nil {
 		return fmt.Errorf("unable to get ACME certificates : %v", err)
 	}
+
+	// Init the cache which contains the domains with a resolution in progress
+	p.resolutionInProgressCache = cache.New(5*time.Minute, 2*time.Minute)
 
 	return nil
 }
@@ -372,6 +378,14 @@ func (p *Provider) resolveCertificate(domain types.Domain, domainFromConfigurati
 	if len(uncheckedDomains) == 0 {
 		return nil, nil
 	}
+
+	defer func() {
+		p.resolutionInProgressMutex.Lock()
+		defer p.resolutionInProgressMutex.Unlock()
+		for _, domain := range uncheckedDomains {
+			p.resolutionInProgressCache.Delete(domain)
+		}
+	}()
 
 	log.Debugf("Loading ACME certificates %+v...", uncheckedDomains)
 
@@ -636,6 +650,9 @@ func (p *Provider) renewCertificates() {
 // Get provided certificate which check a domains list (Main and SANs)
 // from static and dynamic provided certificates
 func (p *Provider) getUncheckedDomains(domainsToCheck []string, checkConfigurationDomains bool) []string {
+	p.resolutionInProgressMutex.Lock()
+	defer p.resolutionInProgressMutex.Unlock()
+
 	log.Debugf("Looking for provided certificate(s) to validate %q...", domainsToCheck)
 
 	allDomains := p.certificateStore.GetAllDomains()
@@ -645,6 +662,11 @@ func (p *Provider) getUncheckedDomains(domainsToCheck []string, checkConfigurati
 		allDomains = append(allDomains, strings.Join(certificate.Domain.ToStrArray(), ","))
 	}
 
+	// Get currently resolved domains
+	for domain := range p.resolutionInProgressCache.Items() {
+		allDomains = append(allDomains, domain)
+	}
+
 	// Get Configuration Domains
 	if checkConfigurationDomains {
 		for i := 0; i < len(p.Domains); i++ {
@@ -652,7 +674,14 @@ func (p *Provider) getUncheckedDomains(domainsToCheck []string, checkConfigurati
 		}
 	}
 
-	return searchUncheckedDomains(domainsToCheck, allDomains)
+	uncheckedDomains := searchUncheckedDomains(domainsToCheck, allDomains)
+
+	// Add unchecked domains to the list of domains currently resolved
+	for _, domain := range uncheckedDomains {
+		p.resolutionInProgressCache.SetDefault(domain, nil)
+	}
+
+	return uncheckedDomains
 }
 
 func searchUncheckedDomains(domainsToCheck []string, existentDomains []string) []string {
@@ -664,7 +693,7 @@ func searchUncheckedDomains(domainsToCheck []string, existentDomains []string) [
 	}
 
 	if len(uncheckedDomains) == 0 {
-		log.Debugf("No ACME certificate to generate for domains %q.", domainsToCheck)
+		log.Debugf("No ACME certificate generation required for domains %q.", domainsToCheck)
 	} else {
 		log.Debugf("Domains %q need ACME certificates generation for domains %q.", domainsToCheck, strings.Join(uncheckedDomains, ","))
 	}
