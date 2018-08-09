@@ -14,6 +14,7 @@ import (
 	acmeprovider "github.com/containous/traefik/provider/acme"
 	"github.com/containous/traefik/tls/generate"
 	"github.com/containous/traefik/types"
+	"github.com/patrickmn/go-cache"
 	"github.com/stretchr/testify/assert"
 	"github.com/xenolf/lego/acme"
 )
@@ -331,9 +332,12 @@ func TestAcme_getUncheckedCertificates(t *testing.T) {
 	mm["*.containo.us"] = &tls.Certificate{}
 	mm["traefik.acme.io"] = &tls.Certificate{}
 
-	a := ACME{TLSConfig: &tls.Config{NameToCertificate: mm}}
+	ripCache := cache.New(5*time.Second, 2*time.Second)
+	ripCache.SetDefault("*.traefik.wtf", nil)
 
-	domains := []string{"traefik.containo.us", "trae.containo.us"}
+	a := ACME{TLSConfig: &tls.Config{NameToCertificate: mm}, resolutionInProgressCache: ripCache}
+
+	domains := []string{"traefik.containo.us", "trae.containo.us", "foo.traefik.wtf"}
 	uncheckedDomains := a.getUncheckedDomains(domains, nil)
 	assert.Empty(t, uncheckedDomains)
 	domains = []string{"traefik.acme.io", "trae.acme.io"}
@@ -351,6 +355,10 @@ func TestAcme_getUncheckedCertificates(t *testing.T) {
 	account := Account{DomainsCertificate: domainsCertificates}
 	uncheckedDomains = a.getUncheckedDomains(domains, &account)
 	assert.Empty(t, uncheckedDomains)
+	domains = []string{"traefik.containo.us", "trae.containo.us", "traefik.wtf"}
+	uncheckedDomains = a.getUncheckedDomains(domains, nil)
+	assert.Len(t, uncheckedDomains, 1)
+	ripCache.Flush()
 }
 
 func TestAcme_getProvidedCertificate(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/ty/fun"
@@ -26,6 +27,7 @@ import (
 	"github.com/containous/traefik/types"
 	"github.com/containous/traefik/version"
 	"github.com/eapache/channels"
+	"github.com/patrickmn/go-cache"
 	"github.com/sirupsen/logrus"
 	"github.com/xenolf/lego/acme"
 	legolog "github.com/xenolf/lego/log"
@@ -40,30 +42,32 @@ var (
 // ACME allows to connect to lets encrypt and retrieve certs
 // Deprecated Please use provider/acme/Provider
 type ACME struct {
-	Email                 string                      `description:"Email address used for registration"`
-	Domains               []types.Domain              `description:"SANs (alternative domains) to each main domain using format: --acme.domains='main.com,san1.com,san2.com' --acme.domains='main.net,san1.net,san2.net'"`
-	Storage               string                      `description:"File or key used for certificates storage."`
-	StorageFile           string                      // Deprecated
-	OnDemand              bool                        `description:"(Deprecated) Enable on demand certificate generation. This will request a certificate from Let's Encrypt during the first TLS handshake for a hostname that does not yet have a certificate."` // Deprecated
-	OnHostRule            bool                        `description:"Enable certificate generation on frontends Host rules."`
-	CAServer              string                      `description:"CA server to use."`
-	EntryPoint            string                      `description:"Entrypoint to proxy acme challenge to."`
-	KeyType               string                      `description:"KeyType used for generating certificate private key. Allow value 'EC256', 'EC384', 'RSA2048', 'RSA4096', 'RSA8192'. Default to 'RSA4096'"`
-	DNSChallenge          *acmeprovider.DNSChallenge  `description:"Activate DNS-01 Challenge"`
-	HTTPChallenge         *acmeprovider.HTTPChallenge `description:"Activate HTTP-01 Challenge"`
-	TLSChallenge          *acmeprovider.TLSChallenge  `description:"Activate TLS-ALPN-01 Challenge"`
-	DNSProvider           string                      `description:"(Deprecated) Activate DNS-01 Challenge"`                                                                    // Deprecated
-	DelayDontCheckDNS     flaeg.Duration              `description:"(Deprecated) Assume DNS propagates after a delay in seconds rather than finding and querying nameservers."` // Deprecated
-	ACMELogging           bool                        `description:"Enable debug logging of ACME actions."`
-	OverrideCertificates  bool                        `description:"Enable to override certificates in key-value store when using storeconfig"`
-	client                *acme.Client
-	store                 cluster.Store
-	challengeHTTPProvider *challengeHTTPProvider
-	challengeTLSProvider  *challengeTLSProvider
-	checkOnDemandDomain   func(domain string) bool
-	jobs                  *channels.InfiniteChannel
-	TLSConfig             *tls.Config `description:"TLS config in case wildcard certs are used"`
-	dynamicCerts          *safe.Safe
+	Email                     string                      `description:"Email address used for registration"`
+	Domains                   []types.Domain              `description:"SANs (alternative domains) to each main domain using format: --acme.domains='main.com,san1.com,san2.com' --acme.domains='main.net,san1.net,san2.net'"`
+	Storage                   string                      `description:"File or key used for certificates storage."`
+	StorageFile               string                      // Deprecated
+	OnDemand                  bool                        `description:"(Deprecated) Enable on demand certificate generation. This will request a certificate from Let's Encrypt during the first TLS handshake for a hostname that does not yet have a certificate."` // Deprecated
+	OnHostRule                bool                        `description:"Enable certificate generation on frontends Host rules."`
+	CAServer                  string                      `description:"CA server to use."`
+	EntryPoint                string                      `description:"Entrypoint to proxy acme challenge to."`
+	KeyType                   string                      `description:"KeyType used for generating certificate private key. Allow value 'EC256', 'EC384', 'RSA2048', 'RSA4096', 'RSA8192'. Default to 'RSA4096'"`
+	DNSChallenge              *acmeprovider.DNSChallenge  `description:"Activate DNS-01 Challenge"`
+	HTTPChallenge             *acmeprovider.HTTPChallenge `description:"Activate HTTP-01 Challenge"`
+	TLSChallenge              *acmeprovider.TLSChallenge  `description:"Activate TLS-ALPN-01 Challenge"`
+	DNSProvider               string                      `description:"(Deprecated) Activate DNS-01 Challenge"`                                                                    // Deprecated
+	DelayDontCheckDNS         flaeg.Duration              `description:"(Deprecated) Assume DNS propagates after a delay in seconds rather than finding and querying nameservers."` // Deprecated
+	ACMELogging               bool                        `description:"Enable debug logging of ACME actions."`
+	OverrideCertificates      bool                        `description:"Enable to override certificates in key-value store when using storeconfig"`
+	client                    *acme.Client
+	store                     cluster.Store
+	challengeHTTPProvider     *challengeHTTPProvider
+	challengeTLSProvider      *challengeTLSProvider
+	checkOnDemandDomain       func(domain string) bool
+	jobs                      *channels.InfiniteChannel
+	TLSConfig                 *tls.Config `description:"TLS config in case wildcard certs are used"`
+	dynamicCerts              *safe.Safe
+	resolutionInProgressCache *cache.Cache
+	resolutionInProgressMutex sync.Mutex
 }
 
 func (a *ACME) init() error {
@@ -76,6 +80,10 @@ func (a *ACME) init() error {
 	}
 
 	a.jobs = channels.NewInfiniteChannel()
+
+	// Init the cache which contains the domains with a resolution in progress
+	a.resolutionInProgressCache = cache.New(5*time.Minute, 2*time.Minute)
+
 	return nil
 }
 
@@ -537,6 +545,15 @@ func (a *ACME) LoadCertificateForDomains(domains []string) {
 		if len(uncheckedDomains) == 0 {
 			return
 		}
+
+		defer func() {
+			a.resolutionInProgressMutex.Lock()
+			defer a.resolutionInProgressMutex.Unlock()
+			for _, domain := range uncheckedDomains {
+				a.resolutionInProgressCache.Delete(domain)
+			}
+		}()
+
 		certificate, err := a.getDomainsCertificates(uncheckedDomains)
 		if err != nil {
 			log.Errorf("Error getting ACME certificates %+v : %v", uncheckedDomains, err)
@@ -603,6 +620,9 @@ func searchProvidedCertificateForDomains(domain string, certs map[string]*tls.Ce
 // Get provided certificate which check a domains list (Main and SANs)
 // from static and dynamic provided certificates
 func (a *ACME) getUncheckedDomains(domains []string, account *Account) []string {
+	a.resolutionInProgressMutex.Lock()
+	defer a.resolutionInProgressMutex.Unlock()
+
 	log.Debugf("Looking for provided certificate to validate %s...", domains)
 	allCerts := make(map[string]*tls.Certificate)
 
@@ -625,6 +645,13 @@ func (a *ACME) getUncheckedDomains(domains []string, account *Account) []string 
 		}
 	}
 
+	// Get currently resolved domains
+	for domain := range a.resolutionInProgressCache.Items() {
+		if _, ok := allCerts[domain]; !ok {
+			allCerts[domain] = &tls.Certificate{}
+		}
+	}
+
 	// Get Configuration Domains
 	for i := 0; i < len(a.Domains); i++ {
 		allCerts[a.Domains[i].Main] = &tls.Certificate{}
@@ -633,7 +660,14 @@ func (a *ACME) getUncheckedDomains(domains []string, account *Account) []string 
 		}
 	}
 
-	return searchUncheckedDomains(domains, allCerts)
+	uncheckedDomains := searchUncheckedDomains(domains, allCerts)
+
+	// Add unchecked domains to the list of domains currently resolved
+	for _, domain := range uncheckedDomains {
+		a.resolutionInProgressCache.SetDefault(domain, nil)
+	}
+
+	return uncheckedDomains
 }
 
 func searchUncheckedDomains(domains []string, certs map[string]*tls.Certificate) []string {
