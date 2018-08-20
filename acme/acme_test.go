@@ -14,7 +14,6 @@ import (
 	acmeprovider "github.com/containous/traefik/provider/acme"
 	"github.com/containous/traefik/tls/generate"
 	"github.com/containous/traefik/types"
-	"github.com/patrickmn/go-cache"
 	"github.com/stretchr/testify/assert"
 	"github.com/xenolf/lego/acme"
 )
@@ -332,10 +331,10 @@ func TestAcme_getUncheckedCertificates(t *testing.T) {
 	mm["*.containo.us"] = &tls.Certificate{}
 	mm["traefik.acme.io"] = &tls.Certificate{}
 
-	ripCache := cache.New(5*time.Second, 2*time.Second)
-	ripCache.SetDefault("*.traefik.wtf", nil)
+	dm := make(map[string]struct{})
+	dm["*.traefik.wtf"] = struct{}{}
 
-	a := ACME{TLSConfig: &tls.Config{NameToCertificate: mm}, resolvingDomainsCache: ripCache}
+	a := ACME{TLSConfig: &tls.Config{NameToCertificate: mm}, resolvingDomains: dm}
 
 	domains := []string{"traefik.containo.us", "trae.containo.us", "foo.traefik.wtf"}
 	uncheckedDomains := a.getUncheckedDomains(domains, nil)
@@ -358,7 +357,6 @@ func TestAcme_getUncheckedCertificates(t *testing.T) {
 	domains = []string{"traefik.containo.us", "trae.containo.us", "traefik.wtf"}
 	uncheckedDomains = a.getUncheckedDomains(domains, nil)
 	assert.Len(t, uncheckedDomains, 1)
-	ripCache.Flush()
 }
 
 func TestAcme_getProvidedCertificate(t *testing.T) {

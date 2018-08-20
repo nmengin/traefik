@@ -21,7 +21,6 @@ import (
 	traefiktls "github.com/containous/traefik/tls"
 	"github.com/containous/traefik/types"
 	"github.com/containous/traefik/version"
-	"github.com/patrickmn/go-cache"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/xenolf/lego/acme"
@@ -63,8 +62,8 @@ type Provider struct {
 	clientMutex            sync.Mutex
 	configFromListenerChan chan types.Configuration
 	pool                   *safe.Pool
-	resolvingDomainsCache  *cache.Cache
-	resolvingDomainsMutex  sync.Mutex
+	resolvingDomains       map[string]struct{}
+	resolvingDomainsMutex  sync.RWMutex
 }
 
 // Certificate is a struct which contains all data needed from an ACME certificate
@@ -148,7 +147,7 @@ func (p *Provider) Init(_ types.Constraints) error {
 	}
 
 	// Init the cache which contains the domains with a resolution in progress
-	p.resolvingDomainsCache = cache.New(5*time.Minute, 2*time.Minute)
+	p.resolvingDomains = make(map[string]struct{})
 
 	return nil
 }
@@ -204,25 +203,6 @@ func (p *Provider) Provide(configurationChan chan<- types.ConfigMessage, pool *s
 	})
 
 	return nil
-}
-
-func (p *Provider) removeResolvingDomains(resolvingDomains []string) {
-	p.resolvingDomainsMutex.Lock()
-	defer p.resolvingDomainsMutex.Unlock()
-
-	for _, domain := range resolvingDomains {
-		p.resolvingDomainsCache.Delete(domain)
-	}
-}
-
-func (p *Provider) addResolvingDomains(resolvingDomains []string) {
-	p.resolvingDomainsMutex.Lock()
-	defer p.resolvingDomainsMutex.Unlock()
-
-	// Add unchecked domains to the list of domains currently resolved
-	for _, domain := range resolvingDomains {
-		p.resolvingDomainsCache.SetDefault(domain, nil)
-	}
 }
 
 func (p *Provider) getClient() (*acme.Client, error) {
@@ -436,6 +416,24 @@ func (p *Provider) resolveCertificate(domain types.Domain, domainFromConfigurati
 	p.addCertificateForDomain(domain, certificate.Certificate, certificate.PrivateKey)
 
 	return certificate, nil
+}
+
+func (p *Provider) removeResolvingDomains(resolvingDomains []string) {
+	p.resolvingDomainsMutex.Lock()
+	defer p.resolvingDomainsMutex.Unlock()
+
+	for _, domain := range resolvingDomains {
+		delete(p.resolvingDomains, domain)
+	}
+}
+
+func (p *Provider) addResolvingDomains(resolvingDomains []string) {
+	p.resolvingDomainsMutex.Lock()
+	defer p.resolvingDomainsMutex.Unlock()
+
+	for _, domain := range resolvingDomains {
+		p.resolvingDomains[domain] = struct{}{}
+	}
 }
 
 func (p *Provider) useCertificateWithRetry(domains []string) bool {
@@ -664,8 +662,8 @@ func (p *Provider) renewCertificates() {
 // Get provided certificate which check a domains list (Main and SANs)
 // from static and dynamic provided certificates
 func (p *Provider) getUncheckedDomains(domainsToCheck []string, checkConfigurationDomains bool) []string {
-	p.resolvingDomainsMutex.Lock()
-	defer p.resolvingDomainsMutex.Unlock()
+	p.resolvingDomainsMutex.RLock()
+	defer p.resolvingDomainsMutex.RUnlock()
 
 	log.Debugf("Looking for provided certificate(s) to validate %q...", domainsToCheck)
 
@@ -677,7 +675,7 @@ func (p *Provider) getUncheckedDomains(domainsToCheck []string, checkConfigurati
 	}
 
 	// Get currently resolved domains
-	for domain := range p.resolvingDomainsCache.Items() {
+	for domain := range p.resolvingDomains {
 		allDomains = append(allDomains, domain)
 	}
 

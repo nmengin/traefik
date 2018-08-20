@@ -27,7 +27,6 @@ import (
 	"github.com/containous/traefik/types"
 	"github.com/containous/traefik/version"
 	"github.com/eapache/channels"
-	"github.com/patrickmn/go-cache"
 	"github.com/sirupsen/logrus"
 	"github.com/xenolf/lego/acme"
 	legolog "github.com/xenolf/lego/log"
@@ -66,8 +65,8 @@ type ACME struct {
 	jobs                  *channels.InfiniteChannel
 	TLSConfig             *tls.Config `description:"TLS config in case wildcard certs are used"`
 	dynamicCerts          *safe.Safe
-	resolvingDomainsCache *cache.Cache
-	resolvingDomainsMutex sync.Mutex
+	resolvingDomains      map[string]struct{}
+	resolvingDomainsMutex sync.RWMutex
 }
 
 func (a *ACME) init() error {
@@ -81,8 +80,8 @@ func (a *ACME) init() error {
 
 	a.jobs = channels.NewInfiniteChannel()
 
-	// Init the cache which contains the domains with a resolution in progress
-	a.resolvingDomainsCache = cache.New(5*time.Minute, 2*time.Minute)
+	// Init the currently resolved domain map
+	a.resolvingDomains = make(map[string]struct{})
 
 	return nil
 }
@@ -584,9 +583,8 @@ func (a *ACME) addResolvingDomains(resolvingDomains []string) {
 	a.resolvingDomainsMutex.Lock()
 	defer a.resolvingDomainsMutex.Unlock()
 
-	// Add unchecked domains to the list of domains currently resolved
 	for _, domain := range resolvingDomains {
-		a.resolvingDomainsCache.SetDefault(domain, nil)
+		a.resolvingDomains[domain] = struct{}{}
 	}
 }
 
@@ -595,7 +593,7 @@ func (a *ACME) removeResolvingDomains(resolvingDomains []string) {
 	defer a.resolvingDomainsMutex.Unlock()
 
 	for _, domain := range resolvingDomains {
-		a.resolvingDomainsCache.Delete(domain)
+		delete(a.resolvingDomains, domain)
 	}
 }
 
@@ -634,8 +632,8 @@ func searchProvidedCertificateForDomains(domain string, certs map[string]*tls.Ce
 // Get provided certificate which check a domains list (Main and SANs)
 // from static and dynamic provided certificates
 func (a *ACME) getUncheckedDomains(domains []string, account *Account) []string {
-	a.resolvingDomainsMutex.Lock()
-	defer a.resolvingDomainsMutex.Unlock()
+	a.resolvingDomainsMutex.RLock()
+	defer a.resolvingDomainsMutex.RUnlock()
 
 	log.Debugf("Looking for provided certificate to validate %s...", domains)
 	allCerts := make(map[string]*tls.Certificate)
@@ -660,7 +658,7 @@ func (a *ACME) getUncheckedDomains(domains []string, account *Account) []string 
 	}
 
 	// Get currently resolved domains
-	for domain := range a.resolvingDomainsCache.Items() {
+	for domain := range a.resolvingDomains {
 		if _, ok := allCerts[domain]; !ok {
 			allCerts[domain] = &tls.Certificate{}
 		}
