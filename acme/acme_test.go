@@ -335,7 +335,7 @@ func TestAcme_getUncheckedCertificates(t *testing.T) {
 	ripCache := cache.New(5*time.Second, 2*time.Second)
 	ripCache.SetDefault("*.traefik.wtf", nil)
 
-	a := ACME{TLSConfig: &tls.Config{NameToCertificate: mm}, resolutionInProgressCache: ripCache}
+	a := ACME{TLSConfig: &tls.Config{NameToCertificate: mm}, resolvingDomainsCache: ripCache}
 
 	domains := []string{"traefik.containo.us", "trae.containo.us", "foo.traefik.wtf"}
 	uncheckedDomains := a.getUncheckedDomains(domains, nil)

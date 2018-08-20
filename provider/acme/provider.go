@@ -53,18 +53,18 @@ type Configuration struct {
 // Provider holds configurations of the provider.
 type Provider struct {
 	*Configuration
-	Store                     Store
-	certificates              []*Certificate
-	account                   *Account
-	client                    *acme.Client
-	certsChan                 chan *Certificate
-	configurationChan         chan<- types.ConfigMessage
-	certificateStore          *traefiktls.CertificateStore
-	clientMutex               sync.Mutex
-	configFromListenerChan    chan types.Configuration
-	pool                      *safe.Pool
-	resolutionInProgressCache *cache.Cache
-	resolutionInProgressMutex sync.Mutex
+	Store                  Store
+	certificates           []*Certificate
+	account                *Account
+	client                 *acme.Client
+	certsChan              chan *Certificate
+	configurationChan      chan<- types.ConfigMessage
+	certificateStore       *traefiktls.CertificateStore
+	clientMutex            sync.Mutex
+	configFromListenerChan chan types.Configuration
+	pool                   *safe.Pool
+	resolvingDomainsCache  *cache.Cache
+	resolvingDomainsMutex  sync.Mutex
 }
 
 // Certificate is a struct which contains all data needed from an ACME certificate
@@ -148,7 +148,7 @@ func (p *Provider) Init(_ types.Constraints) error {
 	}
 
 	// Init the cache which contains the domains with a resolution in progress
-	p.resolutionInProgressCache = cache.New(5*time.Minute, 2*time.Minute)
+	p.resolvingDomainsCache = cache.New(5*time.Minute, 2*time.Minute)
 
 	return nil
 }
@@ -204,6 +204,25 @@ func (p *Provider) Provide(configurationChan chan<- types.ConfigMessage, pool *s
 	})
 
 	return nil
+}
+
+func (p *Provider) removeResolvingDomains(resolvingDomains []string) {
+	p.resolvingDomainsMutex.Lock()
+	defer p.resolvingDomainsMutex.Unlock()
+
+	for _, domain := range resolvingDomains {
+		p.resolvingDomainsCache.Delete(domain)
+	}
+}
+
+func (p *Provider) addResolvingDomains(resolvingDomains []string) {
+	p.resolvingDomainsMutex.Lock()
+	defer p.resolvingDomainsMutex.Unlock()
+
+	// Add unchecked domains to the list of domains currently resolved
+	for _, domain := range resolvingDomains {
+		p.resolvingDomainsCache.SetDefault(domain, nil)
+	}
 }
 
 func (p *Provider) getClient() (*acme.Client, error) {
@@ -379,13 +398,8 @@ func (p *Provider) resolveCertificate(domain types.Domain, domainFromConfigurati
 		return nil, nil
 	}
 
-	defer func() {
-		p.resolutionInProgressMutex.Lock()
-		defer p.resolutionInProgressMutex.Unlock()
-		for _, domain := range uncheckedDomains {
-			p.resolutionInProgressCache.Delete(domain)
-		}
-	}()
+	p.addResolvingDomains(uncheckedDomains)
+	defer p.removeResolvingDomains(uncheckedDomains)
 
 	log.Debugf("Loading ACME certificates %+v...", uncheckedDomains)
 
@@ -650,8 +664,8 @@ func (p *Provider) renewCertificates() {
 // Get provided certificate which check a domains list (Main and SANs)
 // from static and dynamic provided certificates
 func (p *Provider) getUncheckedDomains(domainsToCheck []string, checkConfigurationDomains bool) []string {
-	p.resolutionInProgressMutex.Lock()
-	defer p.resolutionInProgressMutex.Unlock()
+	p.resolvingDomainsMutex.Lock()
+	defer p.resolvingDomainsMutex.Unlock()
 
 	log.Debugf("Looking for provided certificate(s) to validate %q...", domainsToCheck)
 
@@ -663,7 +677,7 @@ func (p *Provider) getUncheckedDomains(domainsToCheck []string, checkConfigurati
 	}
 
 	// Get currently resolved domains
-	for domain := range p.resolutionInProgressCache.Items() {
+	for domain := range p.resolvingDomainsCache.Items() {
 		allDomains = append(allDomains, domain)
 	}
 
@@ -674,14 +688,7 @@ func (p *Provider) getUncheckedDomains(domainsToCheck []string, checkConfigurati
 		}
 	}
 
-	uncheckedDomains := searchUncheckedDomains(domainsToCheck, allDomains)
-
-	// Add unchecked domains to the list of domains currently resolved
-	for _, domain := range uncheckedDomains {
-		p.resolutionInProgressCache.SetDefault(domain, nil)
-	}
-
-	return uncheckedDomains
+	return searchUncheckedDomains(domainsToCheck, allDomains)
 }
 
 func searchUncheckedDomains(domainsToCheck []string, existentDomains []string) []string {
