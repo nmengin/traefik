@@ -515,7 +515,7 @@ func startTestServer(port string, statusCode int) (ts *httptest.Server) {
 // that traefik routes the requests to the expected backends thanks to given certificate if possible
 // otherwise thanks to the default one.
 func (s *HTTPSSuite) TestWithSNIDynamicConfigRouteWithNoChange(c *check.C) {
-	dynamicConfFileName := s.adaptFile(c, "fixtures/https/dynamic_https.toml", struct{}{})
+	dynamicConfFileName := s.adaptFile(c, "fixtures/https/subdir/dynamic_https.toml", struct{}{})
 	defer os.Remove(dynamicConfFileName)
 	confFileName := s.adaptFile(c, "fixtures/https/dynamic_https_sni.toml", struct {
 		DynamicConfFileName string
@@ -584,7 +584,7 @@ func (s *HTTPSSuite) TestWithSNIDynamicConfigRouteWithNoChange(c *check.C) {
 // it routes the requests to the expected backends thanks to given certificate if possible
 // otherwise thanks to the default one.
 func (s *HTTPSSuite) TestWithSNIDynamicConfigRouteWithChange(c *check.C) {
-	dynamicConfFileName := s.adaptFile(c, "fixtures/https/dynamic_https.toml", struct{}{})
+	dynamicConfFileName := s.adaptFile(c, "fixtures/https/subdir/dynamic_https.toml", struct{}{})
 	defer os.Remove(dynamicConfFileName)
 	confFileName := s.adaptFile(c, "fixtures/https/dynamic_https_sni.toml", struct {
 		DynamicConfFileName string
@@ -654,7 +654,7 @@ func (s *HTTPSSuite) TestWithSNIDynamicConfigRouteWithChange(c *check.C) {
 // it routes the requests to the expected backends thanks to given certificate if possible
 // otherwise thanks to the default one.
 func (s *HTTPSSuite) TestWithSNIDynamicConfigRouteWithTlsConfigurationDeletion(c *check.C) {
-	dynamicConfFileName := s.adaptFile(c, "fixtures/https/dynamic_https.toml", struct{}{})
+	dynamicConfFileName := s.adaptFile(c, "fixtures/https/subdir/dynamic_https.toml", struct{}{})
 	defer os.Remove(dynamicConfFileName)
 	confFileName := s.adaptFile(c, "fixtures/https/dynamic_https_sni.toml", struct {
 		DynamicConfFileName string
