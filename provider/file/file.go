@@ -24,11 +24,13 @@ var _ provider.Provider = (*Provider)(nil)
 type Provider struct {
 	provider.BaseProvider `mapstructure:",squash" export:"true"`
 	Directory             string `description:"Load configuration from one or more .toml files in a directory" export:"true"`
+	watchedDirectories    map[string][]string
 	TraefikFile           string
 }
 
 // Init the provider
 func (p *Provider) Init(constraints types.Constraints) error {
+	p.watchedDirectories = make(map[string][]string)
 	return p.BaseProvider.Init(constraints)
 }
 
@@ -36,29 +38,60 @@ func (p *Provider) Init(constraints types.Constraints) error {
 // using the given configuration channel.
 func (p *Provider) Provide(configurationChan chan<- types.ConfigMessage, pool *safe.Pool) error {
 	configuration, err := p.BuildConfiguration()
-
 	if err != nil {
 		return err
 	}
 
 	if p.Watch {
-		var watchItem string
-
+		var directoriesToWatch []string
 		if len(p.Directory) > 0 {
-			watchItem = p.Directory
+			directoriesToWatch, err = p.getDirectoriesRecursively(p.Directory)
+			if err != nil {
+				return fmt.Errorf("unable to initialize provider File: %v", err)
+			}
 		} else if len(p.Filename) > 0 {
-			watchItem = filepath.Dir(p.Filename)
+			directoriesToWatch = []string{filepath.Dir(p.Filename)}
 		} else {
-			watchItem = filepath.Dir(p.TraefikFile)
+			directoriesToWatch = []string{filepath.Dir(p.TraefikFile)}
 		}
 
-		if err := p.addWatcher(pool, watchItem, configurationChan, p.watcherCallback); err != nil {
+		if err := p.addWatcher(pool, directoriesToWatch, configurationChan, p.watcherCallback); err != nil {
 			return err
 		}
 	}
 
 	sendConfigToChannel(configurationChan, configuration)
 	return nil
+}
+
+func (p *Provider) getDirectoriesRecursively(rootDir string) ([]string, error) {
+	rootDirInfo, err := os.Stat(rootDir)
+	if err != nil {
+		return nil, fmt.Errorf("unable to stat %q: %v", rootDir, err)
+	}
+
+	if !rootDirInfo.IsDir() {
+		return nil, nil
+	}
+
+	fileList, err := ioutil.ReadDir(rootDir)
+	if err != nil {
+		return nil, fmt.Errorf("unable to initialize sub-directories list from directory %s: %v", rootDir, err)
+	}
+
+	directories := []string{rootDir}
+	for _, item := range fileList {
+		if item.IsDir() {
+			subDir, err := p.getDirectoriesRecursively(strings.TrimSuffix(rootDir, "/") + "/" + item.Name())
+			if err != nil {
+				return nil, fmt.Errorf("unable to initialize recursively sub-directories list from directory %s: %v", rootDir, err)
+			}
+			directories = append(directories, subDir...)
+		}
+	}
+	p.watchedDirectories[rootDir] = directories
+
+	return directories, nil
 }
 
 // BuildConfiguration loads configuration either from file or a directory specified by 'Filename'/'Directory'
@@ -79,15 +112,17 @@ func (p *Provider) BuildConfiguration() (*types.Configuration, error) {
 	return nil, errors.New("Error using file configuration backend, no filename defined")
 }
 
-func (p *Provider) addWatcher(pool *safe.Pool, directory string, configurationChan chan<- types.ConfigMessage, callback func(chan<- types.ConfigMessage, fsnotify.Event)) error {
+func (p *Provider) addWatcher(pool *safe.Pool, directories []string, configurationChan chan<- types.ConfigMessage, callback func(chan<- types.ConfigMessage)) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("error creating file watcher: %s", err)
 	}
 
-	err = watcher.Add(directory)
-	if err != nil {
-		return fmt.Errorf("error adding file watcher: %s", err)
+	for _, dir := range directories {
+		err = watcher.Add(dir)
+		if err != nil {
+			log.Errorf("Unable to add file watcher on directory %q: %v", dir, err)
+		}
 	}
 
 	// Process events
@@ -98,7 +133,7 @@ func (p *Provider) addWatcher(pool *safe.Pool, directory string, configurationCh
 			case <-stop:
 				return
 			case evt := <-watcher.Events:
-				if p.Directory == "" {
+				if len(p.Directory) == 0 {
 					var filename string
 					if len(p.Filename) > 0 {
 						filename = p.Filename
@@ -109,10 +144,28 @@ func (p *Provider) addWatcher(pool *safe.Pool, directory string, configurationCh
 					_, evtFileName := filepath.Split(evt.Name)
 					_, confFileName := filepath.Split(filename)
 					if evtFileName == confFileName {
-						callback(configurationChan, evt)
+						callback(configurationChan)
 					}
 				} else {
-					callback(configurationChan, evt)
+
+					if evt.Op == fsnotify.Remove || evt.Op == fsnotify.Rename {
+						if subDirectories, exists := p.watchedDirectories[evt.Name]; exists {
+							for i := len(subDirectories) - 1; i >= 0; i-- {
+								watcher.Remove(subDirectories[i])
+								delete(p.watchedDirectories, subDirectories[i])
+							}
+						}
+					} else if evt.Op == fsnotify.Create {
+						dirToAdd, err := p.getDirectoriesRecursively(evt.Name)
+						if err != nil {
+							log.Errorf("Unable to get sub-directories to add to watcher (root directory: %s): %v", evt.Name, err)
+						} else {
+							for _, dir := range dirToAdd {
+								watcher.Add(dir)
+							}
+						}
+					}
+					callback(configurationChan)
 				}
 			case err := <-watcher.Errors:
 				log.Errorf("Watcher event error: %s", err)
@@ -122,8 +175,9 @@ func (p *Provider) addWatcher(pool *safe.Pool, directory string, configurationCh
 	return nil
 }
 
-func (p *Provider) watcherCallback(configurationChan chan<- types.ConfigMessage, event fsnotify.Event) {
+func (p *Provider) watcherCallback(configurationChan chan<- types.ConfigMessage) {
 	watchItem := p.TraefikFile
+
 	if len(p.Directory) > 0 {
 		watchItem = p.Directory
 	} else if len(p.Filename) > 0 {
@@ -131,12 +185,11 @@ func (p *Provider) watcherCallback(configurationChan chan<- types.ConfigMessage,
 	}
 
 	if _, err := os.Stat(watchItem); err != nil {
-		log.Debugf("Unable to watch %s : %v", watchItem, err)
+		log.Debugf("Unable to get modifications from directory %s : %v", watchItem, err)
 		return
 	}
 
 	configuration, err := p.BuildConfiguration()
-
 	if err != nil {
 		log.Errorf("Error occurred during watcher callback: %s", err)
 		return
@@ -190,7 +243,6 @@ func (p *Provider) loadFileConfig(filename string, parseTemplate bool) (*types.C
 
 func (p *Provider) loadFileConfigFromDirectory(directory string, configuration *types.Configuration) (*types.Configuration, error) {
 	fileList, err := ioutil.ReadDir(directory)
-
 	if err != nil {
 		return configuration, fmt.Errorf("unable to read directory %s: %v", directory, err)
 	}
