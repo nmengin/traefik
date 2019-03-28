@@ -9,20 +9,9 @@ defaultEntryPoints = ["http", "https"]
   address = ":443"
     [entryPoints.https.tls]
 
-[acme]
-email = "test@traefik.io"
-storage = "traefik/acme/account"
-entryPoint = "https"
-onHostRule = true
-caServer = "http://traefik.boulder.com:4001/directory"
-[acme.httpChallenge]
-entryPoint="http"
-
-
 [api]
 
-[docker]
-endpoint = "unix:///var/run/docker.sock"
-domain = "localhost.com"
+[etcd]
+endpoint = "10.0.1.12:2379"
 watch = true
-exposedByDefault = false
+prefix = "/traefik"
